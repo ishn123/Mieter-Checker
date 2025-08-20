@@ -96,8 +96,32 @@ const DEFAULT_MAPPING = {
   }
 };
 
-// ---------- Text-Extraktion aus PDF/OCR ----------
-async function readPdfText(file: File){
+// ===================================================================
+// === PATCH REGION: ProgressBar (UI-Komponente) — START
+// ===================================================================
+function ProgressBar({ value }: { value: number }) {
+  const v = Math.min(100, Math.max(0, Math.round(value || 0)));
+  return (
+    <div className="w-full mt-2">
+      <div className="h-2 bg-gray-200 rounded">
+        <div
+          className="h-2 bg-blue-500 rounded transition-all"
+          style={{ width: `${v}%` }}
+        />
+      </div>
+      <p className="text-xs text-muted-foreground mt-1">{v}%</p>
+    </div>
+  );
+}
+// ===================================================================
+// === PATCH REGION: ProgressBar — END
+// ===================================================================
+
+
+// ===================================================================
+// === PATCH REGION: PDF/OCR Funktionen (mit Progress) — START
+// ===================================================================
+async function readPdfText(file: File, onProgress?: (n:number)=>void){
   const data = await file.arrayBuffer();
   const pdf = await pdfjs.getDocument({ data }).promise;
   let full = '';
@@ -106,11 +130,12 @@ async function readPdfText(file: File){
     const content = await page.getTextContent({ includeMarkedContent: true });
     const pageText = (content.items as any[]).map(it=> (it as any).str).filter(Boolean).join('\n');
     full += pageText + '\n';
+    onProgress?.(Math.round((p/pdf.numPages)*100));  // Seiten-Fortschritt
   }
   return full.trim();
 }
 
-async function ocrPdfFirstPage(file: File){
+async function ocrPdfFirstPage(file: File, onProgress?: (n:number)=>void){
   const data = await file.arrayBuffer();
   const pdf = await pdfjs.getDocument({ data }).promise;
   const page = await pdf.getPage(1);
@@ -120,15 +145,27 @@ async function ocrPdfFirstPage(file: File){
   canvas.width = viewport.width; canvas.height = viewport.height;
   await page.render({ canvasContext: ctx as any, viewport }).promise;
 
-  // Sprachdaten-URL (stabil mobil)
-  const opts:any = { langPath: "https://tessdata.projectnaptha.com/4.0.0" };
+  const opts:any = {
+    langPath: "https://tessdata.projectnaptha.com/4.0.0",
+    logger: (m:any) => {
+      if (m?.status === 'recognizing text' && typeof m.progress === 'number'){
+        onProgress?.(Math.round(m.progress * 100));  // OCR-Fortschritt
+      }
+    }
+  };
+
   try {
     const { data: ocr } = await (Tesseract as any).recognize(canvas, 'deu', opts);
-    if (ocr?.text && ocr.text.trim().length > 10) return ocr.text;
-  } catch {}
-  const { data: ocrEng } = await (Tesseract as any).recognize(canvas, 'eng', opts);
-  return ocrEng.text || '';
+    return (ocr?.text || '');
+  } catch {
+    const { data: ocrEng } = await (Tesseract as any).recognize(canvas, 'eng', opts);
+    return (ocrEng?.text || '');
+  }
 }
+// ===================================================================
+// === PATCH REGION: PDF/OCR Funktionen — END
+// ===================================================================
+
 
 // ---------- Robuster Contract-Extractor ----------
 function extractWithMapping(text: string, mapping = DEFAULT_MAPPING){
@@ -209,7 +246,7 @@ export default function MietCheckerApp(){
     try { return JSON.parse(localStorage.getItem('mc-settings')||'{}'); } catch { return {}; } 
   });
 
-  // Defaults setzen
+  // Defaults
   useEffect(()=> {
     setSettings((s:any)=>({
       autoDraftOnUpload: s?.autoDraftOnUpload ?? true,
@@ -247,7 +284,7 @@ export default function MietCheckerApp(){
     }; 
   }), [contracts, units, properties]);
 
-  // Bank-Abgleich (IBAN ODER voller Name ODER Adresse/Zimmer im Verwendungszweck)
+  // Bank-Abgleich
   const { monthDate, matches, missing, partial, overpaid } = useMemo(()=>{
     const [year, m] = selectedMonth.split("-").map(Number);
     const monthDate = new Date(year, m-1, 1);
@@ -300,7 +337,7 @@ export default function MietCheckerApp(){
     return { monthDate, matches, missing, partial, overpaid };
   }, [selectedMonth, txs, tenants, graceDays, amountTolerance]);
 
-  // ---------- CSV Import ----------
+  // CSV Import
   const [txHeaders, setTxHeaders] = useState<string[]>([]);
   const [txMap, setTxMap] = useState<any>({ date: "date", amount: "amount", name: "name", iban: "iban", reference: "reference" });
   const onUploadTxs = (file: File) => {
@@ -311,7 +348,7 @@ export default function MietCheckerApp(){
     }});
   };
 
-  // ---------- Auto-Draft (Posteingang) ----------
+  // Auto-Draft (Posteingang)
   const ensurePropertyByAddress = (address: string) => {
     if (!address) return null;
     const p = properties.find((pp:any) => (pp.address||"").toLowerCase() === address.toLowerCase() || (pp.name||"").toLowerCase() === address.toLowerCase());
@@ -380,20 +417,15 @@ export default function MietCheckerApp(){
     setPending((all:any[]) => all.filter((d:any)=> !d.matchedUnit));
   };
 
-  // ---------- UI Hilfsfunktionen ----------
+  // UI Hilfsfunktionen
   const downloadCsv = (rows:any[], name:string) => { const csv = Papa.unparse(rows); const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"}); const url = URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url); };
-  const exportOpen = () => downloadCsv(
-    matches.map(({tenant,due}:any)=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", room: tenant.roomNumber||"", name: tenant.name, iban: tenant.iban, expected: tenant.expected, dueDay: tenant.dueDay, month: format(monthDate,"MM.yyyy"), dueUntil: format(due,"dd.MM.yyyy"), reference: tenant.reference||"" }))
-      .filter((r:any)=>!r.reference?.includes('Bezahlt')),
-    `offene-mieten-${selectedMonth}.csv`
-  );
+  const exportOpen = () => downloadCsv(missing.map(({tenant,due}:any)=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", room: tenant.roomNumber||"", name: tenant.name, iban: tenant.iban, expected: tenant.expected, dueDay: tenant.dueDay, month: format(monthDate,"MM.yyyy"), dueUntil: format(due,"dd.MM.yyyy"), reference: tenant.reference||"" })), `offene-mieten-${selectedMonth}.csv`);
   const exportAll = () => downloadCsv(matches.map(({tenant,tx,status,info}:any)=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", room: tenant.roomNumber||"", tenant: tenant.name, iban: tenant.iban, expected: tenant.expected, status, info, tx_date: tx? format(tx.date,"dd.MM.yyyy"):"", tx_amount: tx? tx.amount: "", tx_name: tx?.name||"", tx_reference: tx?.reference||"" })), `mietabgleich-${selectedMonth}.csv`);
 
   const rentLabel = settings?.rentLabel || "Miete";
 
   return (
     <div>
-      {/* Banner: Posteingang */}
       {pending.length>0 && (
         <div style={{background:'#fff7ed', border:'1px solid #fed7aa', borderRadius:12, padding:'10px 12px', marginBottom:12, display:'flex', gap:8, alignItems:'center', justifyContent:'space-between'}}>
           <div style={{display:'flex', alignItems:'center', gap:8}}><Inbox size={16}/><b>{pending.length}</b> neue Vertrag-Entwürfe aus PDF erkannt. Jetzt bestätigen.</div>
@@ -439,7 +471,17 @@ export default function MietCheckerApp(){
         <TabsContent value="vertraege"><ContractsSection units={units} properties={properties} contracts={contracts} setContracts={setContracts} rentLabel={rentLabel} /></TabsContent>
         <TabsContent value="bank"><BankSection txHeaders={txHeaders} txMap={txMap} setTxMap={setTxMap} onUploadTxs={onUploadTxs} /></TabsContent>
         <TabsContent value="uebersicht"><OverviewSection matches={matches} missing={missing} partial={partial} overpaid={overpaid} selectedMonth={selectedMonth} /></TabsContent>
-        <TabsContent value="kiimport"><KiImportSection onAutoDraft={createDraftsFromExtraction} settings={settings} /></TabsContent>
+
+        {/* ===================================================================
+            === PATCH REGION: KI-IMPORT SECTION (mit Ladebalken) — START
+            =================================================================== */}
+        <TabsContent value="kiimport">
+          <KiImportSectionWithProgress onAutoDraft={createDraftsFromExtraction} settings={settings}/>
+        </TabsContent>
+        {/* ===================================================================
+            === PATCH REGION: KI-IMPORT SECTION — END
+            =================================================================== */}
+
         <TabsContent value="einstellungen"><SettingsSection
           graceDays={graceDays} amountTolerance={amountTolerance}
           setGraceDays={setGraceDays} setAmountTolerance={setAmountTolerance}
@@ -673,11 +715,13 @@ function SettingsSection({
   );
 }
 
-// ------------------ KI-Import (mit robustem Datei-Check & Fehler-Logs) ------------------
-function KiImportSection({ onAutoDraft, settings }:{ onAutoDraft:(previews:any[])=>void; settings:any;}){
-  const [mappingText] = useState(JSON.stringify(DEFAULT_MAPPING, null, 2));
+// ===================================================================
+// === PATCH REGION: KI-IMPORT SECTION (mit Ladebalken) — START
+// ===================================================================
+function KiImportSectionWithProgress({ onAutoDraft, settings }:{ onAutoDraft:(previews:any[])=>void; settings:any;}){
   const [results, setResults] = useState<any[]>([]);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   const detectPdf = (file: File) => {
     const t = (file.type||"").toLowerCase();
@@ -686,40 +730,71 @@ function KiImportSection({ onAutoDraft, settings }:{ onAutoDraft:(previews:any[]
 
   const onFiles = async (files: File[]) => {
     setBusy(true);
+    setProgress(0);
     try{
-      JSON.parse(mappingText); // nur Validierung, aktuell verwenden wir DEFAULT_MAPPING
       const previews: any[] = [];
-      for (const file of files){
+
+      for (let idx=0; idx<files.length; idx++){
+        const file = files[idx];
         let text = "";
+        setProgress(1);
+
         try {
           if (detectPdf(file)) {
-            text = await readPdfText(file);
-            if (!text || text.length < 30) text = await ocrPdfFirstPage(file);
+            // 1) PDF-Text mit Seiten-Fortschritt
+            text = await readPdfText(file, (p)=> setProgress(Math.max(p, 5)));
+            // 2) Falls leer -> OCR (mit echtem Fortschritt)
+            if (!text || text.length < 10) {
+              setProgress(0);
+              text = await ocrPdfFirstPage(file, (p)=> setProgress(p));
+            }
           } else if ((file.type||"").startsWith("text/") || /\.txt$/i.test(file.name||"")){
             text = await file.text();
+            setProgress(100);
           } else {
-            // letzter Versuch, falls MIME fehlt
-            try { text = await readPdfText(file); } catch {}
-            if (!text || text.length < 30) try { text = await ocrPdfFirstPage(file); } catch {}
+            // MIME unbekannt -> vorsichtig PDF versuchen
+            try { text = await readPdfText(file, (p)=> setProgress(p)); } catch {}
+            if (!text || text.length < 10) {
+              setProgress(0);
+              try { text = await ocrPdfFirstPage(file, (p)=> setProgress(p)); } catch {}
+            }
           }
         } catch (err) {
           console.error("PDF/Scan lesen fehlgeschlagen:", err);
         }
 
+        if (!text || text.length < 1) text = "(kein Text erkannt – ggf. OCR nötig)";
         const extracted = extractWithMapping(text||"", DEFAULT_MAPPING);
-        previews.push({ fileName: (file as any).name, textLength: (text||"").length, extracted, matchedUnit: null });
+
+        previews.push({
+          fileName: file.name,
+          textLength: (text||"").length,
+          extracted,
+          matchedUnit: null
+        });
+
+        if (idx < files.length - 1) setProgress(0);
       }
+
       setResults(previews);
       if (settings?.autoDraftOnUpload) onAutoDraft(previews);
+      setProgress(100);
     }catch(e:any){
       console.error('KI-Import Fehler:', e);
       alert('Analyse fehlgeschlagen: ' + (e?.message || e));
-    } finally { setBusy(false); }
+      setProgress(0);
+    } finally { 
+      setBusy(false); 
+      setTimeout(()=> setProgress(0), 800);
+    }
   };
 
   return (
     <Card>
-      <CardHeader><CardTitle>Verträge importieren (KI)</CardTitle><CardDescription>PDF/Scan hochladen → Entwürfe im Posteingang bestätigen</CardDescription></CardHeader>
+      <CardHeader>
+        <CardTitle>Verträge importieren (KI)</CardTitle>
+        <CardDescription>PDF/Scan hochladen → Entwürfe im Posteingang bestätigen</CardDescription>
+      </CardHeader>
       <CardContent className="space-y-3">
         <Input type="file" accept="application/pdf,text/plain" multiple
                onChange={(e)=> e.target.files && onFiles([...(e.target.files as any)])} />
@@ -727,31 +802,43 @@ function KiImportSection({ onAutoDraft, settings }:{ onAutoDraft:(previews:any[]
                 onClick={()=> (document.querySelector('input[type=file]') as HTMLInputElement)?.click()}>
           <Upload size={16}/>Dateien wählen
         </Button>
-        {busy && <p>Analysiere …</p>}
+
+        {busy && <ProgressBar value={progress} />}
 
         {(!settings?.autoDraftOnUpload && results.length>0) && (
-          <>
-            <p className="muted" style={{marginTop:8}}>Auto-Posteingang ist deaktiviert. Vorschau unten, Übernahme manuell.</p>
-            <Table className="mt-3">
-              <TableHeader><TableRow><TableHead>Datei</TableHead><TableHead>Mieter</TableHead><TableHead>{"Miete (EUR)"}</TableHead><TableHead>Kaution</TableHead><TableHead>Start</TableHead><TableHead>Einheit</TableHead><TableHead>Zimmer</TableHead><TableHead>Adresse</TableHead></TableRow></TableHeader>
-              <TableBody>
-                {results.map((r:any,i:number)=> (
-                  <TableRow key={i}>
-                    <TableCell className="text-sm">{r.fileName}</TableCell>
-                    <TableCell>{r.extracted.tenantName||'–'}</TableCell>
-                    <TableCell>{Number(r.extracted.expected||0).toFixed(2)}</TableCell>
-                    <TableCell>{Number(r.extracted.deposit||0).toFixed(2)}</TableCell>
-                    <TableCell>{r.extracted.startDate||'–'}</TableCell>
-                    <TableCell>{r.extracted.unitLabel||'–'}</TableCell>
-                    <TableCell>{r.extracted.roomNumber||'–'}</TableCell>
-                    <TableCell>{r.extracted.address||'–'}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </>
+          <Table className="mt-3">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Datei</TableHead>
+                <TableHead>Mieter</TableHead>
+                <TableHead>Miete (EUR)</TableHead>
+                <TableHead>Kaution</TableHead>
+                <TableHead>Start</TableHead>
+                <TableHead>Einheit</TableHead>
+                <TableHead>Zimmer</TableHead>
+                <TableHead>Adresse</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {results.map((r:any,i:number)=> (
+                <TableRow key={i}>
+                  <TableCell className="text-sm">{r.fileName}</TableCell>
+                  <TableCell>{r.extracted.tenantName||'–'}</TableCell>
+                  <TableCell>{Number(r.extracted.expected||0).toFixed(2)}</TableCell>
+                  <TableCell>{Number(r.extracted.deposit||0).toFixed(2)}</TableCell>
+                  <TableCell>{r.extracted.startDate||'–'}</TableCell>
+                  <TableCell>{r.extracted.unitLabel||'–'}</TableCell>
+                  <TableCell>{r.extracted.roomNumber||'–'}</TableCell>
+                  <TableCell>{r.extracted.address||'–'}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         )}
       </CardContent>
     </Card>
   );
 }
+// ===================================================================
+// === PATCH REGION: KI-IMPORT SECTION — END
+// ===================================================================
