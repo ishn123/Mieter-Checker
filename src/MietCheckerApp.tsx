@@ -1,107 +1,270 @@
-
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Papa from "papaparse";
 import { format, parse, isSameMonth } from "date-fns";
 import { de } from "date-fns/locale";
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Badge, Tabs, TabsContent, TabsList, TabsTrigger, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea } from "./ui";
-import { Save, FileDown, CheckCircle2, XCircle, AlertTriangle, Settings2, CalendarDays, Home, PlusCircle, FileSignature, Smartphone, Bot, Upload } from "lucide-react";
+import { Save, FileDown, CheckCircle2, XCircle, AlertTriangle, Settings2, CalendarDays, PlusCircle, FileSignature, Bot, Upload } from "lucide-react";
 
+// PDF + OCR
 import * as pdfjs from "pdfjs-dist";
 import Tesseract from "tesseract.js";
 pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.js`;
 
 /** @typedef {{id:string; name:string; address:string}} Property */
 /** @typedef {{id:string; propertyId:string; label:string; rooms:number}} Unit */
-/** @typedef {{id:string; unitId:string; tenantName:string; tenantIban:string; expected:number; dueDay:number; reference?:string; startDate?:string; endDate?:string; deposit?:number}} Contract */
+/** @typedef {{id:string; unitId:string; tenantName:string; tenantIban:string; expected:number; dueDay:number; reference?:string; startDate?:string; endDate?:string; deposit?:number; roomNumber?:string}} Contract */
 /** @typedef {{date:Date; amount:number; name?:string; iban?:string; reference?:string}} Tx */
 
 const uid = () => Math.random().toString(36).slice(2, 9);
-const parseNumber = (v) => { if (typeof v === "number") return v; if (!v) return NaN; const s=String(v).trim().replace(/\./g,"").replace(",","."); const n=Number(s); return Number.isFinite(n)?n:NaN; };
-const tryParseDate = (v) => { if (v instanceof Date && !isNaN(v)) return v; if (typeof v!=="string") return new Date(NaN); const s=v.trim(); const fmts=["dd.MM.yyyy","yyyy-MM-dd","dd.MM.yy","dd/MM/yyyy","MM/dd/yyyy"]; for (const f of fmts){ const d=parse(s,f,new Date()); if(!isNaN(d)) return d;} return new Date(s); };
-const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+const parseNumber = (v:any) => { if (typeof v === "number") return v; if (!v) return NaN; const s=String(v).trim().replace(/\./g,"").replace(",","."); const n=Number(s); return Number.isFinite(n)?n:NaN; };
+const tryParseDate = (v:any) => { if (v instanceof Date && !isNaN(v as any)) return v; if (typeof v!=="string") return new Date(NaN); const s=v.trim(); const fmts=["dd.MM.yyyy","yyyy-MM-dd","dd.MM.yy","dd/MM/yyyy","MM/dd/yyyy"]; for (const f of fmts){ const d=parse(s,f,new Date()); if(!isNaN(d as any)) return d;} return new Date(s); };
+const monthKey = (d:Date) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
 
-function parseEuro(s){ const m=String(s).replace(/\./g,'').replace(',','.').match(/-?\d+(?:\.\d+)?/); return m? Number(m[0]) : NaN; }
-function parseDateDE(s){ const m=String(s).match(/(\d{1,2})\.(\d{1,2})\.(\d{2,4})/); if(!m) return null; let [_,d,mo,y]=m; if(y.length===2) y='20'+y; return new Date(`${y}-${mo}-${d}`); }
+// ---------- Parsers & helpers (robust) ----------
+function parseEuro(s: string){
+  const m = String(s).replace(/\./g,'').replace(',', '.').match(/-?\d+(?:\.\d+)?/);
+  return m ? Number(m[0]) : NaN;
+}
+function parseDateDE(s: string){
+  const m = String(s).match(/(\d{1,2})\.(\d{1,2})\.(\d{2,4})/);
+  if(!m) return null;
+  let [_,d,mo,y] = m;
+  if (y.length === 2) y = '20' + y;
+  return new Date(`${y}-${mo}-${d}`);
+}
+function findLineIndex(lines: string[], anchor: string){
+  return lines.findIndex(l => new RegExp(anchor, 'i').test(l));
+}
+function grabNumberNear(lines: string[], idx: number, span = 8){
+  for (let i = idx; i <= Math.min(idx + span, lines.length - 1); i++){
+    const n = parseEuro(lines[i]);
+    if (Number.isFinite(n)) return n!;
+  }
+  return null;
+}
+function grabDateNear(lines: string[], idx: number, span = 8){
+  for (let i = idx; i <= Math.min(idx + span, lines.length - 1); i++){
+    const d = parseDateDE(lines[i]);
+    if (d) return d;
+  }
+  return null;
+}
+function grabTextAfter(lines: string[], idx: number, span = 3){
+  for (let i = idx + 1; i <= Math.min(idx + span, lines.length - 1); i++){
+    const s = lines[i].trim();
+    if (s) return s;
+  }
+  return null;
+}
+function pickRoomNumber(s?: string){
+  if (!s) return "";
+  const m = String(s).match(/\b(Zimmer|Zi|Whg|Wohnung)\s*[-.:]*\s*(\d{1,3})\b/i) || String(s).match(/\b(\d{1,3})\b/);
+  return m ? (m[2] || m[1]) : "";
+}
+// normalization for name matching
+function norm(s?: string){
+  return (s||"")
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase().replace(/[^a-z0-9\s]/g,' ')
+    .replace(/\s+/g,' ').trim();
+}
+function tokens(name: string){
+  return norm(name).split(' ').filter(t => t.length >= 2);
+}
+function tokenOverlap(a: string, b: string){
+  const A = new Set(tokens(a));
+  const B = new Set(tokens(b));
+  if (A.size === 0 || B.size === 0) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / Math.max(A.size, B.size);
+}
 
+// ----- Mapping: anchors stable, values variable -----
 const DEFAULT_MAPPING = {
   fields: {
-    tenantName: { anchor: "Mieter(?:in)?|Name Mieter", take: "lineAfter" },
-    rent: { anchor: "(?:Kalt)?Miete(?: monatlich)?|Miete gesamt", take: "sameLineNumber", num: "euro" },
-    deposit: { anchor: "Kaution|Sicherheitsleistung", take: "sameLineNumber", num: "euro" },
-    startDate: { anchor: "Mietbeginn|Beginn des Mietverh\\u00e4ltnisses", take: "sameLineDate", date: "de" },
-    roomLabel: { anchor: "Zimmernummer|Zimmer|Wohnung|Whg", take: "sameLineText" },
-    iban: { anchor: "IBAN", take: "sameLineText" }
+    tenantName: { anchors: ["^\\s*Name\\s*:", "\\bMieter(?:in)?\\b"], mode: "nameGuess" },
+    rent:       { anchors: ["\\bMiete\\b", "\\bGrundmiete\\b", "^\\s*§?2\\b"], mode: "numberNear" },
+    deposit:    { anchors: ["\\bKaution\\b", "Mietsicherheit"], mode: "numberNear" },
+    startDate:  { anchors: ["beginnt am", "Mietbeginn", "Beginn des Mietverh"], mode: "dateNear" },
+    address:    { anchors: ["straße|strasse|weg|platz|allee|gasse|ring|damm|ufer"], mode: "addressSmart" },
+    roomLabel:  { anchors: ["Zimmernummer|Zimmer|Zi\\b|Wohnung|Whg"], mode: "textNear" }
   }
 };
 
-function extractWithMapping(text, mapping){
-  const lines = text.split(/\\r?\\n/).map(l=>l.trim()).filter(Boolean);
-  const grab = (anchor, how) => {
-    const idx = lines.findIndex(l => new RegExp(anchor, 'i').test(l));
-    if (idx === -1) return null;
-    if (how === 'lineAfter') return lines[idx+1]||null;
-    if (how === 'sameLineNumber') return parseEuro(lines[idx]);
-    if (how === 'sameLineDate') return parseDateDE(lines[idx]);
-    if (how === 'sameLineText') return lines[idx].replace(new RegExp(anchor, 'i'), '').replace(/[:\\-\\s]+$/,'').trim();
-    return null;
+// ---------- Robust extractor (PDF text) ----------
+function extractWithMapping(text: string, mapping = DEFAULT_MAPPING){
+  const rawLines = text.split(/\r?\n/);
+  const lines = rawLines.map(l => l.trim()).filter(Boolean);
+
+  const findByAnchors = (anchors: string[]) => {
+    for (const a of anchors){
+      const i = findLineIndex(lines, a);
+      if (i !== -1) return i;
+    }
+    return -1;
   };
+
+  function guessName(){
+    const idx = findByAnchors(["^\\s*Name\\s*:", "\\bMieter(?:in)?\\b"]);
+    if (idx !== -1) {
+      const after = lines[idx].replace(/^Name\s*:\s*/i, '').trim() || grabTextAfter(lines, idx, 2) || '';
+      if (after && !/Vermieter/i.test(after)) return after;
+    }
+    for (const s of lines){
+      if (/\d|EURO|§/i.test(s)) continue;
+      const parts = s.split(/\s+/);
+      if (parts.length >= 2 && /^[A-ZÄÖÜ][a-zäöüß\-]+$/.test(parts[0]) && /^[A-ZÄÖÜ][a-zäöüß\-]+$/.test(parts[1])){
+        return s;
+      }
+    }
+    return "";
+  }
+
+  // Address: line with street + house no; append next line if contains ZIP + city
+  function findAddress(){
+    const streetIdx = lines.findIndex(l => /\b(\d{1,4})([a-zA-Z]?)\b/.test(l) && /(straße|strasse|weg|platz|allee|gasse|ring|damm|ufer)/i.test(l));
+    if (streetIdx === -1) return "";
+    let adr = lines[streetIdx];
+    const next = lines[streetIdx + 1] || "";
+    if (/\b\d{5}\b/.test(next)) adr = adr + ", " + next;
+    return adr;
+  }
+
   const f = mapping.fields;
-  const start = grab(f.startDate.anchor, f.startDate.take);
+
+  const tenantName = f.tenantName?.mode === "nameGuess" ? guessName() : "";
+  const rentIdx    = findByAnchors(f.rent.anchors);
+  const depositIdx = findByAnchors(f.deposit.anchors);
+  const startIdx   = findByAnchors(f.startDate.anchors);
+  const roomIdx    = findByAnchors(f.roomLabel.anchors);
+
+  const expected = rentIdx    !== -1 ? (grabNumberNear(lines, rentIdx, 8)   ?? 0) : 0;
+  const deposit  = depositIdx !== -1 ? (grabNumberNear(lines, depositIdx,8) ?? 0) : 0;
+  const start    = startIdx   !== -1 ?  grabDateNear(lines, startIdx, 8)      : null;
+
+  const roomSource = roomIdx !== -1 ? (grabTextAfter(lines, roomIdx, 2) || lines[roomIdx]) : "";
+  const unitLabel  = roomSource || "";
+  const roomNumber = pickRoomNumber(roomSource);
+
+  const address = findAddress();
+
   return {
-    tenantName: grab(f.tenantName.anchor, f.tenantName.take) || '',
-    expected: grab(f.rent.anchor, f.rent.take) || 0,
-    deposit: grab(f.deposit.anchor, f.deposit.take) || 0,
-    startDate: start ? start.toISOString?.()?.slice(0,10) : null,
-    unitLabel: grab(f.roomLabel.anchor, f.roomLabel.take) || '',
-    iban: grab(f.iban.anchor, f.iban.take) || ''
+    tenantName,
+    expected,
+    deposit,
+    startDate: start ? start.toISOString().slice(0,10) : null,
+    unitLabel,
+    roomNumber,      // <- NEW
+    iban: "",
+    address          // <- NEW
   };
 }
 
+// ------------------ App ------------------
 export default function MietCheckerApp(){
-  const [properties, setProperties] = useState([]);
-  const [units, setUnits] = useState([]);
-  const [contracts, setContracts] = useState([]);
-  const [txs, setTxs] = useState([]);
+  const [properties, setProperties] = useState<any[]>([]);
+  const [units, setUnits] = useState<any[]>([]);
+  const [contracts, setContracts] = useState<any[]>([]);
+  const [txs, setTxs] = useState<any[]>([]);
 
   const [selectedMonth, setSelectedMonth] = useState(() => monthKey(new Date()));
   const [graceDays, setGraceDays] = useState(3);
   const [amountTolerance, setAmountTolerance] = useState(2);
-  const [settings, setSettings] = useState(()=>{ try { return JSON.parse(localStorage.getItem('mc-settings')||'{}'); } catch { return {}; } });
+  const [settings, setSettings] = useState<any>(()=>{ try { return JSON.parse(localStorage.getItem('mc-settings')||'{}'); } catch { return {}; } });
 
-  useEffect(()=>{ const raw=localStorage.getItem('mc-data'); if(raw){ try{ const s=JSON.parse(raw); setProperties(s.properties||[]); setUnits(s.units||[]); setContracts(s.contracts||[]); setTxs((s.txs||[]).map(t=>({...t,date:new Date(t.date)}))); }catch{} } },[]);
+  useEffect(()=>{ const raw=localStorage.getItem('mc-data'); if(raw){ try{ const s=JSON.parse(raw); setProperties(s.properties||[]); setUnits(s.units||[]); setContracts(s.contracts||[]); setTxs((s.txs||[]).map((t:any)=>({...t,date:new Date(t.date)}))); }catch{} } },[]);
   useEffect(()=>{ localStorage.setItem('mc-data', JSON.stringify({properties,units,contracts,txs})); },[properties,units,contracts,txs]);
   useEffect(()=>{ localStorage.setItem('mc-settings', JSON.stringify(settings||{})); },[settings]);
 
-  const tenants = useMemo(()=> contracts.map(c=>{ const u = units.find(x=>x.id===c.unitId); const p = u? properties.find(pp=>pp.id===u.propertyId):undefined; return { name: c.tenantName, iban: c.tenantIban, expected: c.expected, dueDay: c.dueDay, reference: c.reference || (p? `Miete ${p.name}`: "Miete"), propertyName: p?.name, unitLabel: u?.label }; }), [contracts, units, properties]);
+  // Build tenant records (include roomNumber if present)
+  const tenants = useMemo(()=> contracts.map((c:any)=>{ 
+    const u = units.find((x:any)=>x.id===c.unitId); 
+    const p = u? properties.find((pp:any)=>pp.id===u.propertyId):undefined; 
+    return { 
+      name: c.tenantName, 
+      iban: c.tenantIban, 
+      expected: c.expected, 
+      dueDay: c.dueDay, 
+      reference: c.reference || (p? `Miete ${p.name}`: "Miete"), 
+      propertyName: p?.name, 
+      unitLabel: u?.label, 
+      roomNumber: c.roomNumber || "" 
+    }; 
+  }), [contracts, units, properties]);
 
+  // Strong matching (IBAN OR full name tokens OR address/room from reference)
   const { monthDate, matches, missing, partial, overpaid } = useMemo(()=>{
-    const [year, m] = selectedMonth.split("-").map(Number); const monthDate = new Date(year, m-1, 1);
-    const monthTxs = txs.filter(tx=> isSameMonth(tx.date, monthDate));
-    const normalize = (s)=> (s||"").toLowerCase().replace(/\\s+/g," ").trim();
-    const matches = tenants.map(ten=>{
+    const [year, m] = selectedMonth.split("-").map(Number);
+    const monthDate = new Date(year, m-1, 1);
+    const monthTxs = txs.filter((tx:any)=> isSameMonth(tx.date, monthDate));
+
+    const matches = tenants.map((ten:any)=>{
       const due = new Date(year, m-1, Math.min(ten.dueDay + graceDays, 28));
       const lo = ten.expected - amountTolerance, hi = ten.expected + amountTolerance;
-      const candidate = monthTxs.find(tx=>{ const ok = tx.amount<0 && -tx.amount>=lo && -tx.amount<=hi; if(!ok) return false; const ibanOk = ten.iban && tx.iban && ten.iban.replace(/\\s+/g,"")===tx.iban.replace(/\\s+/g,""); const r1=normalize(ten.reference), r2=normalize(tx.reference); const n1=normalize(ten.name), n2=normalize(tx.name); const refOk = r1 && r2 && (r2.includes(r1)||r1.includes(r2)); const nameOk = n1 && n2 && (n2.includes(n1)||n1.includes(n2)); return ibanOk || refOk || nameOk;});
-      let status = "missing", info = "Keine Zahlung gefunden"; if(candidate){ const amt=-candidate.amount; if(Math.abs(amt-ten.expected)<=amountTolerance){ status="ok"; info=`Bezahlt am ${format(candidate.date,"dd.MM.yyyy",{locale:de})} (${amt.toFixed(2)} €)`; } else if(amt < ten.expected){ status="partial"; info=`Teilzahlung ${amt.toFixed(2)} € (erwartet ${ten.expected.toFixed(2)} €)`; } else { status="over"; info=`Überzahlung ${amt.toFixed(2)} € (erwartet ${ten.expected.toFixed(2)} €)`; } }
+
+      const candidate = monthTxs.find((tx:any)=>{
+        const amountOk = tx.amount < 0 && -tx.amount >= lo && -tx.amount <= hi;
+        if (!amountOk) return false;
+
+        // 1) IBAN exact — strongest signal
+        const ibanOk = ten.iban && tx.iban && ten.iban.replace(/\s+/g,'') === tx.iban.replace(/\s+/g,'');
+
+        // 2) Strong full-name match (works even without reference)
+        const strongName =
+          tokenOverlap(ten.name || "", tx.name || "") >= 0.6 ||
+          tokenOverlap(ten.name || "", tx.reference || "") >= 0.6;
+
+        // 3) Address + room number from reference (if present)
+        const ref = norm(tx.reference);
+        const roomNum = ten.roomNumber ? norm(ten.roomNumber) : "";
+        const unitNorm = norm(ten.unitLabel || "");
+        const propNorm = norm(ten.propertyName || "");
+        const addressRoomOk = ref && (
+          (unitNorm && ref.includes(unitNorm)) ||
+          (propNorm && ref.includes(propNorm)) ||
+          (roomNum && ref.includes(roomNum))
+        );
+
+        return ibanOk || strongName || addressRoomOk;
+      });
+
+      let status = "missing", info = "Keine Zahlung gefunden";
+      if (candidate){
+        const amt = -candidate.amount;
+        if (Math.abs(amt - ten.expected) <= amountTolerance){
+          status = "ok";
+          info   = `Bezahlt am ${format(candidate.date,"dd.MM.yyyy",{locale:de})} (${amt.toFixed(2)} €)`;
+        } else if (amt < ten.expected){
+          status = "partial";
+          info   = `Teilzahlung ${amt.toFixed(2)} € (erwartet ${ten.expected.toFixed(2)} €)`;
+        } else {
+          status = "over";
+          info   = `Überzahlung ${amt.toFixed(2)} € (erwartet ${ten.expected.toFixed(2)} €)`;
+        }
+      }
       return { tenant: ten, tx: candidate, status, info, due };
     });
-    const missing = matches.filter(m=>m.status==="missing"), partial = matches.filter(m=>m.status==="partial"), overpaid = matches.filter(m=>m.status==="over");
+
+    const missing  = matches.filter((m:any)=>m.status==="missing");
+    const partial  = matches.filter((m:any)=>m.status==="partial");
+    const overpaid = matches.filter((m:any)=>m.status==="over");
     return { monthDate, matches, missing, partial, overpaid };
   }, [selectedMonth, txs, tenants, graceDays, amountTolerance]);
 
-  const [txHeaders, setTxHeaders] = useState([]);
-  const [txMap, setTxMap] = useState({ date: "date", amount: "amount", name: "name", iban: "iban", reference: "reference" });
-  const onUploadTxs = (file) => {
-    Papa.parse(file, { header:true, skipEmptyLines:true, complete:(res)=>{
+  const [txHeaders, setTxHeaders] = useState<string[]>([]);
+  const [txMap, setTxMap] = useState<any>({ date: "date", amount: "amount", name: "name", iban: "iban", reference: "reference" });
+  const onUploadTxs = (file: File) => {
+    Papa.parse(file, { header:true, skipEmptyLines:true, complete:(res:any)=>{
       const rows = res.data||[]; if(rows.length) setTxHeaders(Object.keys(rows[0]));
-      const t = rows.map(r=>({ date: tryParseDate(r[txMap.date]), amount: parseNumber(r[txMap.amount]), name: r[txMap.name]?.toString()?.trim(), iban: r[txMap.iban]?.toString()?.replace(/\\s+/g, ""), reference: r[txMap.reference]?.toString()?.trim() })).filter(x=>!isNaN(x.date)&&Number.isFinite(x.amount));
+      const t = rows.map((r:any)=>({ date: tryParseDate(r[txMap.date]), amount: parseNumber(r[txMap.amount]), name: r[txMap.name]?.toString()?.trim(), iban: r[txMap.iban]?.toString()?.replace(/\s+/g, ""), reference: r[txMap.reference]?.toString()?.trim() })).filter((x:any)=>!isNaN(x.date as any)&&Number.isFinite(x.amount));
       setTxs(t);
     }});
   };
 
-  const downloadCsv = (rows, name) => { const csv = Papa.unparse(rows); const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"}); const url = URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url); };
-  const exportOpen = () => downloadCsv(missing.map(({tenant,due})=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", name: tenant.name, iban: tenant.iban, expected: tenant.expected, dueDay: tenant.dueDay, month: format(monthDate,"MM.yyyy"), dueUntil: format(due,"dd.MM.yyyy"), reference: tenant.reference||"" })), `offene-mieten-${selectedMonth}.csv`);
-  const exportAll = () => downloadCsv(matches.map(({tenant,tx,status,info})=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", tenant: tenant.name, iban: tenant.iban, expected: tenant.expected, status, info, tx_date: tx? format(tx.date,"dd.MM.yyyy"):"", tx_amount: tx? tx.amount: "", tx_name: tx?.name||"", tx_reference: tx?.reference||"" })), `mietabgleich-${selectedMonth}.csv`);
+  const downloadCsv = (rows:any[], name:string) => { const csv = Papa.unparse(rows); const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"}); const url = URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url); };
+  const exportOpen = () => downloadCsv(missing.map(({tenant,due}:any)=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", room: tenant.roomNumber||"", name: tenant.name, iban: tenant.iban, expected: tenant.expected, dueDay: tenant.dueDay, month: format(monthDate,"MM.yyyy"), dueUntil: format(due,"dd.MM.yyyy"), reference: tenant.reference||"" })), `offene-mieten-${selectedMonth}.csv`);
+  const exportAll = () => downloadCsv(matches.map(({tenant,tx,status,info}:any)=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", room: tenant.roomNumber||"", tenant: tenant.name, iban: tenant.iban, expected: tenant.expected, status, info, tx_date: tx? format(tx.date,"dd.MM.yyyy"):"", tx_amount: tx? tx.amount: "", tx_name: tx?.name||"", tx_reference: tx?.reference||"" })), `mietabgleich-${selectedMonth}.csv`);
 
   const rentLabel = settings?.rentLabel || "Miete";
 
@@ -109,8 +272,8 @@ export default function MietCheckerApp(){
     <div>
       <header style={{display:'flex', gap:12, alignItems:'flex-end', justifyContent:'space-between', marginBottom:12}}>
         <div>
-          <h1 style={{fontSize:24, fontWeight:700}}>Miet‑Checker PRO (PWA + KI)</h1>
-          <p className="muted">Installierbar · Offline · KI‑Vertragsimport (PDF/Scan)</p>
+          <h1 style={{fontSize:24, fontWeight:700}}>Miet-Checker PRO (PWA + KI)</h1>
+          <p className="muted">Installierbar · Offline · KI-Vertragsimport (PDF/Scan)</p>
         </div>
         <div style={{display:'flex', gap:8, alignItems:'center'}}>
           <div style={{display:'flex', gap:6, alignItems:'center'}}>
@@ -148,10 +311,10 @@ export default function MietCheckerApp(){
   );
 }
 
-function ObjectsUnitsSection({ properties, setProperties, units, setUnits }){
+function ObjectsUnitsSection({ properties, setProperties, units, setUnits }:{properties:any[];setProperties:any;units:any[];setUnits:any;}){
   const [propSel, setPropSel] = useState('');
   return (
-    <div className="grid md:grid-cols-2 gap-6" style={{display:'grid', gap:16, gridTemplateColumns:'1fr'}}>
+    <div style={{display:'grid', gap:16}}>
       <Card>
         <CardHeader><CardTitle>Objekt anlegen</CardTitle><CardDescription>Adresse optional</CardDescription></CardHeader>
         <CardContent className="space-y-3">
@@ -176,7 +339,7 @@ function ObjectsUnitsSection({ properties, setProperties, units, setUnits }){
                 </SelectContent>
               </Select>
             </div>
-            <div><Label>Bezeichnung</Label><Input id="unit-label" placeholder="Whg 3 links / Zi 2"/></div>
+            <div><Label>Bezeichnung</Label><Input id="unit-label" placeholder="Whg 3 links / Zi 5"/></div>
             <div><Label>Zimmer</Label><Input id="unit-rooms" type="number" min={1} defaultValue={1}/></div>
           </div>
           <Button onClick={()=>{ const label=(document.getElementById('unit-label') as HTMLInputElement).value?.trim(); const rooms=Number((document.getElementById('unit-rooms') as HTMLInputElement).value||1); if(!propSel||!label) return; setUnits((u:any[])=>[...u,{id:uid(), propertyId:propSel, label, rooms: rooms||1}]); (document.getElementById('unit-label') as HTMLInputElement).value=""; (document.getElementById('unit-rooms') as HTMLInputElement).value="1"; }}>Hinzufügen</Button>
@@ -187,7 +350,7 @@ function ObjectsUnitsSection({ properties, setProperties, units, setUnits }){
   );
 }
 
-function ContractsSection({ units, properties, contracts, setContracts, rentLabel }){
+function ContractsSection({ units, properties, contracts, setContracts, rentLabel }:{units:any[];properties:any[];contracts:any[];setContracts:any;rentLabel:string;}){
   const [cUnit, setCUnit] = useState('');
   return (
     <Card>
@@ -204,19 +367,34 @@ function ContractsSection({ units, properties, contracts, setContracts, rentLabe
           <div><Label>IBAN</Label><Input id="c-iban" placeholder="DE.."/></div>
           <div><Label>{rentLabel} (€)</Label><Input id="c-expected" type="number" min={0} step="0.5"/></div>
           <div><Label>Fälligkeit (Tag)</Label><Input id="c-dueday" type="number" min={1} max={28} defaultValue={3}/></div>
-          <div><Label>Verwendungszweck</Label><Input id="c-ref" placeholder="z. B. Miete Whg 3"/></div>
+          <div><Label>Verwendungszweck</Label><Input id="c-ref" placeholder="z. B. Miete Whg 3 / Zi 5"/></div>
           <div><Label>Start</Label><Input id="c-start" type="date"/></div>
           <div><Label>Ende (optional)</Label><Input id="c-end" type="date"/></div>
           <div><Label>Kaution (€, optional)</Label><Input id="c-dep" type="number" min={0} step="0.5"/></div>
+          <div><Label>Zimmernummer (optional)</Label><Input id="c-room" type="text" placeholder="z. B. 5"/></div>
         </div>
-        <Button onClick={()=>{ const name=(document.getElementById('c-name') as HTMLInputElement).value?.trim(); const iban=(document.getElementById('c-iban') as HTMLInputElement).value?.replace(/\\s+/g,""); const expected=parseNumber((document.getElementById('c-expected') as HTMLInputElement).value); const dueDay=Number((document.getElementById('c-dueday') as HTMLInputElement).value||3); const reference=(document.getElementById('c-ref') as HTMLInputElement).value?.trim(); const startDate=(document.getElementById('c-start') as HTMLInputElement).value; const endDate=(document.getElementById('c-end') as HTMLInputElement).value; const deposit=parseNumber((document.getElementById('c-dep') as HTMLInputElement).value); if(!cUnit||!name||!iban||!Number.isFinite(expected)) return; setContracts((cs:any[])=>[...cs,{id:uid(), unitId:cUnit, tenantName:name, tenantIban:iban, expected, dueDay, reference, startDate, endDate, deposit}]); ['c-name','c-iban','c-expected','c-dueday','c-ref','c-start','c-end','c-dep'].forEach(id=>{ const el=document.getElementById(id) as HTMLInputElement|null; if(el) el.value=""; }); }}>Vertrag speichern</Button>
-        <Table className="mt-4"><TableHeader><TableRow><TableHead>Objekt</TableHead><TableHead>Einheit</TableHead><TableHead>Mieter</TableHead><TableHead>{rentLabel}</TableHead><TableHead>Fälligkeit</TableHead></TableRow></TableHeader><TableBody>{contracts.map((c:any)=>{ const u=units.find((x:any)=>x.id===c.unitId); const p=properties.find((pp:any)=>pp.id===u?.propertyId); return (<TableRow key={c.id}><TableCell>{p?.name||"-"}</TableCell><TableCell>{u?.label||"-"}</TableCell><TableCell>{c.tenantName}</TableCell><TableCell>{Number(c.expected).toFixed(2)} €</TableCell><TableCell>{c.dueDay}.</TableCell></TableRow>); })}</TableBody></Table>
+        <Button onClick={()=>{ 
+          const name=(document.getElementById('c-name') as HTMLInputElement).value?.trim(); 
+          const iban=(document.getElementById('c-iban') as HTMLInputElement).value?.replace(/\s+/g,""); 
+          const expected=parseNumber((document.getElementById('c-expected') as HTMLInputElement).value); 
+          const dueDay=Number((document.getElementById('c-dueday') as HTMLInputElement).value||3); 
+          const reference=(document.getElementById('c-ref') as HTMLInputElement).value?.trim(); 
+          const startDate=(document.getElementById('c-start') as HTMLInputElement).value; 
+          const endDate=(document.getElementById('c-end') as HTMLInputElement).value; 
+          const deposit=parseNumber((document.getElementById('c-dep') as HTMLInputElement).value); 
+          const roomNumber=(document.getElementById('c-room') as HTMLInputElement).value?.trim(); 
+          if(!cUnit||!name||!iban||!Number.isFinite(expected)) return; 
+          setContracts((cs:any[])=>[...cs,{id:uid(), unitId:cUnit, tenantName:name, tenantIban:iban, expected, dueDay, reference, startDate, endDate, deposit, roomNumber}]); 
+          ['c-name','c-iban','c-expected','c-dueday','c-ref','c-start','c-end','c-dep','c-room'].forEach(id=>{ const el=document.getElementById(id) as HTMLInputElement|null; if(el) el.value=""; }); 
+        }}><PlusCircle size={16} />Vertrag speichern</Button>
+
+        <Table className="mt-4"><TableHeader><TableRow><TableHead>Objekt</TableHead><TableHead>Einheit</TableHead><TableHead>Zimmer</TableHead><TableHead>Mieter</TableHead><TableHead>{rentLabel}</TableHead><TableHead>Fälligkeit</TableHead></TableRow></TableHeader><TableBody>{contracts.map((c:any)=>{ const u=units.find((x:any)=>x.id===c.unitId); const p=properties.find((pp:any)=>pp.id===u?.propertyId); return (<TableRow key={c.id}><TableCell>{p?.name||"-"}</TableCell><TableCell>{u?.label||"-"}</TableCell><TableCell>{c.roomNumber||""}</TableCell><TableCell>{c.tenantName}</TableCell><TableCell>{Number(c.expected).toFixed(2)} €</TableCell><TableCell>{c.dueDay}.</TableCell></TableRow>); })}</TableBody></Table>
       </CardContent>
     </Card>
   );
 }
 
-function BankSection({ txHeaders, txMap, setTxMap, onUploadTxs }){
+function BankSection({ txHeaders, txMap, setTxMap, onUploadTxs }:{txHeaders:string[];txMap:any;setTxMap:any;onUploadTxs:(f:File)=>void;}){
   return (
     <Card>
       <CardHeader><CardTitle>Bankumsätze importieren</CardTitle><CardDescription>CSV-Export deiner Bank (Einnahmen meist als negative Beträge)</CardDescription></CardHeader>
@@ -237,14 +415,14 @@ function BankSection({ txHeaders, txMap, setTxMap, onUploadTxs }){
           </div>
         )}
         <div style={{display:'flex', gap:8}}>
-          <Button variant="outline" onClick={()=>{ const sample=`date,amount,name,iban,reference\\n2025-08-03,-950,Max Mustermann,DE02100100109307118603,Miete Max August\\n2025-08-06,-720,Erika Musterfrau,DE12500105170648489890,Miete Erika August`; const blob=new Blob([sample],{type:"text/csv"}); const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download="bank-beispiel.csv"; a.click(); URL.revokeObjectURL(url); }}><FileDown size={16}/>Beispiel-CSV</Button>
+          <Button variant="outline" onClick={()=>{ const sample=`date,amount,name,iban,reference\n2025-08-03,-950,Max Mustermann,DE02100100109307118603,Miete Max August\n2025-08-06,-720,Erika Musterfrau,DE12500105170648489890,Miete Erika August`; const blob=new Blob([sample],{type:"text/csv"}); const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download="bank-beispiel.csv"; a.click(); URL.revokeObjectURL(url); }}><FileDown size={16}/>Beispiel-CSV</Button>
         </div>
       </CardContent>
     </Card>
   );
 }
 
-function OverviewSection({ matches, missing, partial, overpaid, selectedMonth }){
+function OverviewSection({ matches, missing, partial, overpaid, selectedMonth }:{matches:any[];missing:any[];partial:any[];overpaid:any[];selectedMonth:string;}){
   return (
     <Card>
       <CardHeader><CardTitle>Übersicht</CardTitle><CardDescription>Abgleich für {format(new Date(selectedMonth+"-01"), "MMMM yyyy", {locale:de})}</CardDescription></CardHeader>
@@ -256,11 +434,12 @@ function OverviewSection({ matches, missing, partial, overpaid, selectedMonth })
           <Badge>Überzahlungen: {overpaid.length}</Badge>
         </div>
         <Table>
-          <TableHeader><TableRow><TableHead>Objekt</TableHead><TableHead>Einheit</TableHead><TableHead>Mieter</TableHead><TableHead>Erwartet (€)</TableHead><TableHead>Status</TableHead><TableHead>Info</TableHead></TableRow></TableHeader>
+          <TableHeader><TableRow><TableHead>Objekt</TableHead><TableHead>Einheit</TableHead><TableHead>Zimmer</TableHead><TableHead>Mieter</TableHead><TableHead>Erwartet (€)</TableHead><TableHead>Status</TableHead><TableHead>Info</TableHead></TableRow></TableHeader>
           <TableBody>{matches.map(({ tenant, status, info }:any, i:number)=> (
             <TableRow key={i}>
               <TableCell>{tenant.propertyName || "-"}</TableCell>
               <TableCell>{tenant.unitLabel || "-"}</TableCell>
+              <TableCell>{tenant.roomNumber || ""}</TableCell>
               <TableCell style={{fontWeight:600}}>{tenant.name}</TableCell>
               <TableCell>{tenant.expected.toFixed(2)}</TableCell>
               <TableCell>
@@ -278,14 +457,14 @@ function OverviewSection({ matches, missing, partial, overpaid, selectedMonth })
   );
 }
 
-function SettingsSection({ graceDays, amountTolerance, setGraceDays, setAmountTolerance, settings, setSettings }){
+function SettingsSection({ graceDays, amountTolerance, setGraceDays, setAmountTolerance, settings, setSettings }:{graceDays:number;amountTolerance:number;setGraceDays:any;setAmountTolerance:any;settings:any;setSettings:any;}){
   return (
     <Card>
       <CardHeader><CardTitle>Einstellungen</CardTitle><CardDescription>Fälligkeit, Toleranzen & Anzeigenamen</CardDescription></CardHeader>
       <CardContent className="space-y-4">
         <div style={{display:'grid', gap:12, gridTemplateColumns:'1fr 1fr 1fr'}}>
           <div><Label>Nachfrist (Tage)</Label><Input type="number" min={0} max={10} value={graceDays} onChange={(e)=> setGraceDays(Number((e.target as HTMLInputElement).value)||0)}/></div>
-          <div><Label>Betrags‑Toleranz (€)</Label><Input type="number" min={0} step="0.5" value={amountTolerance} onChange={(e)=> setAmountTolerance(Number((e.target as HTMLInputElement).value)||0)}/></div>
+          <div><Label>Betrags-Toleranz (€)</Label><Input type="number" min={0} step="0.5" value={amountTolerance} onChange={(e)=> setAmountTolerance(Number((e.target as HTMLInputElement).value)||0)}/></div>
           <div><Label>Anzeigename für Miete</Label><Input value={settings?.rentLabel||"Miete"} onChange={(e)=> setSettings({...settings, rentLabel: (e.target as HTMLInputElement).value})} /></div>
         </div>
       </CardContent>
@@ -293,9 +472,10 @@ function SettingsSection({ graceDays, amountTolerance, setGraceDays, setAmountTo
   );
 }
 
-function KiImportSection({ units, properties, setContracts }){
+// ------------------ KI Import (PDF/Scan) ------------------
+function KiImportSection({ units, properties, setContracts }:{units:any[];properties:any[];setContracts:any;}){
   const [mappingText, setMappingText] = useState(JSON.stringify(DEFAULT_MAPPING, null, 2));
-  const [results, setResults] = useState([]);
+  const [results, setResults] = useState<any[]>([]);
   const [busy, setBusy] = useState(false);
 
   async function readPdfText(file: File){
@@ -305,8 +485,8 @@ function KiImportSection({ units, properties, setContracts }){
     for (let p=1; p<=pdf.numPages; p++){
       const page = await pdf.getPage(p);
       const content = await page.getTextContent();
-      const pageText = (content.items as any[]).map(it=> (it as any).str).join('\\n');
-      full += pageText + '\\n';
+      const pageText = (content.items as any[]).map(it=> (it as any).str).join('\n');
+      full += pageText + '\n';
     }
     return full.trim();
   }
@@ -340,6 +520,7 @@ function KiImportSection({ units, properties, setContracts }){
           text = await file.text();
         }
         const extracted = extractWithMapping(text, map);
+        // best-effort unit match: prefer exact label, fallback contains
         const label = extracted.unitLabel?.trim();
         let unit: any = null;
         if (label){
@@ -350,7 +531,7 @@ function KiImportSection({ units, properties, setContracts }){
         previews.push({ fileName: (file as any).name, textLength: text.length, extracted, matchedUnit: unit });
       }
       setResults(previews);
-    }catch(e: any){
+    }catch(e:any){
       alert('Mapping ist kein gültiges JSON: '+ e.message);
     } finally { setBusy(false); }
   };
@@ -361,19 +542,33 @@ function KiImportSection({ units, properties, setContracts }){
     setContracts((cs:any[])=> [
       ...cs,
       ...ok.map(({ matchedUnit, extracted }:any) => ({
-        id: uid(), unitId: matchedUnit.id, tenantName: extracted.tenantName, tenantIban: extracted.iban||'', expected: Number(extracted.expected)||0, dueDay: 3, reference: extracted.unitLabel? `Miete ${extracted.unitLabel}`: 'Miete', startDate: extracted.startDate||'', endDate: '', deposit: Number(extracted.deposit)||0,
+        id: uid(),
+        unitId: matchedUnit.id,
+        tenantName: extracted.tenantName,
+        tenantIban: extracted.iban||'',
+        expected: Number(extracted.expected)||0,
+        dueDay: 3,
+        // include address + room number in reference for visibility & matching
+        reference:
+          extracted.unitLabel
+            ? `Miete ${extracted.unitLabel}${extracted.roomNumber ? ' (Zi ' + extracted.roomNumber + ')' : ''} — ${extracted.address || 'Objekt'}`
+            : `Miete${extracted.roomNumber ? ' (Zi ' + extracted.roomNumber + ')' : ''} — ${extracted.address || 'Objekt'}`,
+        startDate: extracted.startDate||'',
+        endDate: '',
+        deposit: Number(extracted.deposit)||0,
+        roomNumber: extracted.roomNumber || ''
       }))
     ]);
     alert(`${ok.length} Vertrag/Verträge angelegt.`);
   };
 
   return (
-    <div style={{display:'grid', gap:16, gridTemplateColumns:'1fr'}}>
+    <div style={{display:'grid', gap:16}}>
       <Card>
         <CardHeader><CardTitle>Mapping</CardTitle><CardDescription>Definiere, wo die KI die Werte findet</CardDescription></CardHeader>
         <CardContent className="space-y-3">
           <Textarea rows={16} value={mappingText} onChange={(e)=> setMappingText((e.target as HTMLTextAreaElement).value)} />
-          <p className="muted" style={{fontSize:14}}>Felder: tenantName, rent→expected, deposit, startDate, roomLabel→unitLabel, iban.</p>
+          <p className="muted" style={{fontSize:14}}>Felder: tenantName, rent→expected, deposit, startDate, roomLabel→roomNumber/unitLabel, address.</p>
         </CardContent>
       </Card>
 
@@ -386,7 +581,7 @@ function KiImportSection({ units, properties, setContracts }){
           {results.length>0 && (
             <>
               <Table className="mt-3">
-                <TableHeader><TableRow><TableHead>Datei</TableHead><TableHead>Mieter</TableHead><TableHead>{"Miete (EUR)"}</TableHead><TableHead>Kaution</TableHead><TableHead>Start</TableHead><TableHead>Einheit</TableHead><TableHead>Status</TableHead></TableRow></TableHeader>
+                <TableHeader><TableRow><TableHead>Datei</TableHead><TableHead>Mieter</TableHead><TableHead>{"Miete (EUR)"}</TableHead><TableHead>Kaution</TableHead><TableHead>Start</TableHead><TableHead>Einheit</TableHead><TableHead>Zimmer</TableHead><TableHead>Adresse</TableHead><TableHead>Status</TableHead></TableRow></TableHeader>
                 <TableBody>
                   {results.map((r:any,i:number)=> (
                     <TableRow key={i}>
@@ -396,6 +591,8 @@ function KiImportSection({ units, properties, setContracts }){
                       <TableCell>{Number(r.extracted.deposit||0).toFixed(2)}</TableCell>
                       <TableCell>{r.extracted.startDate||'–'}</TableCell>
                       <TableCell>{r.matchedUnit? r.matchedUnit.label: (r.extracted.unitLabel||'–')}</TableCell>
+                      <TableCell>{r.extracted.roomNumber||'–'}</TableCell>
+                      <TableCell>{r.extracted.address||'–'}</TableCell>
                       <TableCell>{r.matchedUnit? 'zugeordnet' : 'Einheit nicht gefunden'}</TableCell>
                     </TableRow>
                   ))}
