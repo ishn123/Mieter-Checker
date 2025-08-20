@@ -2,8 +2,16 @@ import React, { useEffect, useMemo, useState } from "react";
 import Papa from "papaparse";
 import { format, parse, isSameMonth } from "date-fns";
 import { de } from "date-fns/locale";
-import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Badge, Tabs, TabsContent, TabsList, TabsTrigger, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea } from "./ui";
-import { Save, FileDown, CheckCircle2, XCircle, AlertTriangle, Settings2, CalendarDays, PlusCircle, FileSignature, Bot, Upload } from "lucide-react";
+import {
+  Button, Card, CardContent, CardDescription, CardHeader, CardTitle,
+  Input, Label, Badge, Tabs, TabsContent, TabsList, TabsTrigger,
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea
+} from "./ui";
+import {
+  Save, FileDown, CheckCircle2, XCircle, AlertTriangle, Settings2,
+  CalendarDays, PlusCircle, FileSignature, Bot, Upload, Inbox
+} from "lucide-react";
 
 // PDF + OCR
 import * as pdfjs from "pdfjs-dist";
@@ -14,13 +22,14 @@ pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/4
 /** @typedef {{id:string; propertyId:string; label:string; rooms:number}} Unit */
 /** @typedef {{id:string; unitId:string; tenantName:string; tenantIban:string; expected:number; dueDay:number; reference?:string; startDate?:string; endDate?:string; deposit?:number; roomNumber?:string}} Contract */
 /** @typedef {{date:Date; amount:number; name?:string; iban?:string; reference?:string}} Tx */
+/** @typedef {{fileName:string; textLength:number; extracted:any; matchedUnit?:any; matchedProperty?:any}} Draft */
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 const parseNumber = (v:any) => { if (typeof v === "number") return v; if (!v) return NaN; const s=String(v).trim().replace(/\./g,"").replace(",","."); const n=Number(s); return Number.isFinite(n)?n:NaN; };
 const tryParseDate = (v:any) => { if (v instanceof Date && !isNaN(v as any)) return v; if (typeof v!=="string") return new Date(NaN); const s=v.trim(); const fmts=["dd.MM.yyyy","yyyy-MM-dd","dd.MM.yy","dd/MM/yyyy","MM/dd/yyyy"]; for (const f of fmts){ const d=parse(s,f,new Date()); if(!isNaN(d as any)) return d;} return new Date(s); };
 const monthKey = (d:Date) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
 
-// ---------- Parsers & helpers (robust) ----------
+// ---------- Parsers & helpers ----------
 function parseEuro(s: string){
   const m = String(s).replace(/\./g,'').replace(',', '.').match(/-?\d+(?:\.\d+)?/);
   return m ? Number(m[0]) : NaN;
@@ -167,17 +176,49 @@ export default function MietCheckerApp(){
   const [units, setUnits] = useState<any[]>([]);
   const [contracts, setContracts] = useState<any[]>([]);
   const [txs, setTxs] = useState<any[]>([]);
+  const [pending, setPending] = useState<any[]>([]); // <- Posteingang (Entwürfe)
 
   const [selectedMonth, setSelectedMonth] = useState(() => monthKey(new Date()));
   const [graceDays, setGraceDays] = useState(3);
   const [amountTolerance, setAmountTolerance] = useState(2);
-  const [settings, setSettings] = useState<any>(()=>{ try { return JSON.parse(localStorage.getItem('mc-settings')||'{}'); } catch { return {}; } });
+  const [settings, setSettings] = useState<any>(()=>{ 
+    try { 
+      return JSON.parse(localStorage.getItem('mc-settings')||'{}'); 
+    } catch { 
+      return {}; 
+    } 
+  });
 
-  useEffect(()=>{ const raw=localStorage.getItem('mc-data'); if(raw){ try{ const s=JSON.parse(raw); setProperties(s.properties||[]); setUnits(s.units||[]); setContracts(s.contracts||[]); setTxs((s.txs||[]).map((t:any)=>({...t,date:new Date(t.date)}))); }catch{} } },[]);
+  // Default-Settings
+  useEffect(()=> {
+    setSettings((s:any)=>({
+      autoDraftOnUpload: s?.autoDraftOnUpload ?? true,
+      autoCreatePropertyUnit: s?.autoCreatePropertyUnit ?? true,
+      rentLabel: s?.rentLabel ?? "Miete",
+      ...s
+    }));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(()=>{ 
+    const raw=localStorage.getItem('mc-data'); 
+    if(raw){ 
+      try{ 
+        const s=JSON.parse(raw); 
+        setProperties(s.properties||[]); 
+        setUnits(s.units||[]); 
+        setContracts(s.contracts||[]); 
+        setTxs((s.txs||[]).map((t:any)=>({...t,date:new Date(t.date)}))); 
+      }catch{} 
+    } 
+    const rawP = localStorage.getItem('mc-pending');
+    if(rawP){ try{ setPending(JSON.parse(rawP)||[]); } catch{} }
+  },[]);
   useEffect(()=>{ localStorage.setItem('mc-data', JSON.stringify({properties,units,contracts,txs})); },[properties,units,contracts,txs]);
   useEffect(()=>{ localStorage.setItem('mc-settings', JSON.stringify(settings||{})); },[settings]);
+  useEffect(()=>{ localStorage.setItem('mc-pending', JSON.stringify(pending||[])); },[pending]);
 
-  // Build tenant records (include roomNumber if present)
+  // Build tenant records (include roomNumber)
   const tenants = useMemo(()=> contracts.map((c:any)=>{ 
     const u = units.find((x:any)=>x.id===c.unitId); 
     const p = u? properties.find((pp:any)=>pp.id===u.propertyId):undefined; 
@@ -207,15 +248,12 @@ export default function MietCheckerApp(){
         const amountOk = tx.amount < 0 && -tx.amount >= lo && -tx.amount <= hi;
         if (!amountOk) return false;
 
-        // 1) IBAN exact — strongest signal
         const ibanOk = ten.iban && tx.iban && ten.iban.replace(/\s+/g,'') === tx.iban.replace(/\s+/g,'');
 
-        // 2) Strong full-name match (works even without reference)
         const strongName =
           tokenOverlap(ten.name || "", tx.name || "") >= 0.6 ||
           tokenOverlap(ten.name || "", tx.reference || "") >= 0.6;
 
-        // 3) Address + room number from reference (if present)
         const ref = norm(tx.reference);
         const roomNum = ten.roomNumber ? norm(ten.roomNumber) : "";
         const unitNorm = norm(ten.unitLabel || "");
@@ -252,6 +290,7 @@ export default function MietCheckerApp(){
     return { monthDate, matches, missing, partial, overpaid };
   }, [selectedMonth, txs, tenants, graceDays, amountTolerance]);
 
+  // ---------- CSV Import ----------
   const [txHeaders, setTxHeaders] = useState<string[]>([]);
   const [txMap, setTxMap] = useState<any>({ date: "date", amount: "amount", name: "name", iban: "iban", reference: "reference" });
   const onUploadTxs = (file: File) => {
@@ -262,6 +301,106 @@ export default function MietCheckerApp(){
     }});
   };
 
+  // ---------- Auto-Draft (Posteingang) ----------
+  const ensurePropertyByAddress = (address: string) => {
+    if (!address) return null;
+    const p = properties.find((pp:any) => (pp.address||"").toLowerCase() === address.toLowerCase() || (pp.name||"").toLowerCase() === address.toLowerCase());
+    if (p) return p;
+    if (!settings?.autoCreatePropertyUnit) return null;
+    const np = { id: uid(), name: address, address };
+    setProperties((prev:any[])=> [...prev, np]);
+    return np;
+  };
+  const ensureUnitByLabel = (propertyId: string, label: string) => {
+    if (!propertyId || !label) return null;
+    const u = units.find((uu:any)=> uu.propertyId===propertyId && uu.label.toLowerCase()===label.toLowerCase());
+    if (u) return u;
+    if (!settings?.autoCreatePropertyUnit) return null;
+    const nu = { id: uid(), propertyId, label, rooms: 1 };
+    setUnits((prev:any[])=> [...prev, nu]);
+    return nu;
+  };
+
+  const createDraftsFromExtraction = (previews: any[]) => {
+    // previews: [{fileName, extracted, matchedUnit?}]
+    const drafts = previews.map((r:any) => {
+      const ex = r.extracted || {};
+      // Property via Adresse
+      let prop = ensurePropertyByAddress(ex.address||"");
+      // Unit label Strategie: bevorzugt PDF unitLabel, sonst Zimmernummer
+      const label = (ex.unitLabel && String(ex.unitLabel).trim())
+        || (ex.roomNumber ? `Zi ${ex.roomNumber}` : "");
+      let unit = null;
+      if (prop && label) unit = ensureUnitByLabel(prop.id, label);
+      // Fallback: wenn prop fehlt, versuchen über existierende Units den Match (wie vorher)
+      if (!unit && r.matchedUnit) unit = r.matchedUnit;
+
+      return {
+        fileName: r.fileName,
+        textLength: r.textLength,
+        extracted: ex,
+        matchedProperty: prop || null,
+        matchedUnit: unit || null
+      };
+    });
+    setPending((prev:any[]) => [...prev, ...drafts]);
+  };
+
+  const confirmDraft = (idx:number) => {
+    const d = pending[idx];
+    if (!d) return;
+    const u = d.matchedUnit;
+    if (!u) { alert('Entwurf hat keine Einheit. Bitte im Posteingang bearbeiten.'); return; }
+    const ref =
+      d.extracted.unitLabel
+        ? `Miete ${d.extracted.unitLabel}${d.extracted.roomNumber ? ' (Zi ' + d.extracted.roomNumber + ')' : ''} — ${d.extracted.address || 'Objekt'}`
+        : `Miete${d.extracted.roomNumber ? ' (Zi ' + d.extracted.roomNumber + ')' : ''} — ${d.extracted.address || 'Objekt'}`;
+    const c: any = {
+      id: uid(),
+      unitId: u.id,
+      tenantName: d.extracted.tenantName || '',
+      tenantIban: d.extracted.iban || '',
+      expected: Number(d.extracted.expected)||0,
+      dueDay: 3,
+      reference: ref,
+      startDate: d.extracted.startDate || '',
+      endDate: '',
+      deposit: Number(d.extracted.deposit)||0,
+      roomNumber: d.extracted.roomNumber || ''
+    };
+    setContracts((cs:any[]) => [...cs, c]);
+    setPending((all:any[]) => all.filter((_:any, i:number)=> i!==idx));
+  };
+  const rejectDraft = (idx:number) => {
+    setPending((all:any[]) => all.filter((_:any, i:number)=> i!==idx));
+  };
+  const confirmAllDrafts = () => {
+    const withUnit = pending.filter((d:any)=> d.matchedUnit);
+    if (withUnit.length === 0){ alert('Keine übernahmefähigen Entwürfe.'); return; }
+    const additions = withUnit.map((d:any)=> {
+      const ref =
+        d.extracted.unitLabel
+          ? `Miete ${d.extracted.unitLabel}${d.extracted.roomNumber ? ' (Zi ' + d.extracted.roomNumber + ')' : ''} — ${d.extracted.address || 'Objekt'}`
+          : `Miete${d.extracted.roomNumber ? ' (Zi ' + d.extracted.roomNumber + ')' : ''} — ${d.extracted.address || 'Objekt'}`;
+      return {
+        id: uid(),
+        unitId: d.matchedUnit.id,
+        tenantName: d.extracted.tenantName || '',
+        tenantIban: d.extracted.iban || '',
+        expected: Number(d.extracted.expected)||0,
+        dueDay: 3,
+        reference: ref,
+        startDate: d.extracted.startDate || '',
+        endDate: '',
+        deposit: Number(d.extracted.deposit)||0,
+        roomNumber: d.extracted.roomNumber || ''
+      };
+    });
+    setContracts((cs:any[]) => [...cs, ...additions]);
+    setPending((all:any[]) => all.filter((d:any)=> !d.matchedUnit));
+  };
+
+  // ---------- UI ----------
   const downloadCsv = (rows:any[], name:string) => { const csv = Papa.unparse(rows); const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"}); const url = URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url); };
   const exportOpen = () => downloadCsv(missing.map(({tenant,due}:any)=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", room: tenant.roomNumber||"", name: tenant.name, iban: tenant.iban, expected: tenant.expected, dueDay: tenant.dueDay, month: format(monthDate,"MM.yyyy"), dueUntil: format(due,"dd.MM.yyyy"), reference: tenant.reference||"" })), `offene-mieten-${selectedMonth}.csv`);
   const exportAll = () => downloadCsv(matches.map(({tenant,tx,status,info}:any)=>({ property: tenant.propertyName||"-", unit: tenant.unitLabel||"-", room: tenant.roomNumber||"", tenant: tenant.name, iban: tenant.iban, expected: tenant.expected, status, info, tx_date: tx? format(tx.date,"dd.MM.yyyy"):"", tx_amount: tx? tx.amount: "", tx_name: tx?.name||"", tx_reference: tx?.reference||"" })), `mietabgleich-${selectedMonth}.csv`);
@@ -270,10 +409,20 @@ export default function MietCheckerApp(){
 
   return (
     <div>
+      {/* Banner: Posteingang */}
+      {pending.length>0 && (
+        <div style={{background:'#fff7ed', border:'1px solid #fed7aa', borderRadius:12, padding:'10px 12px', marginBottom:12, display:'flex', gap:8, alignItems:'center', justifyContent:'space-between'}}>
+          <div style={{display:'flex', alignItems:'center', gap:8}}><Inbox size={16}/><b>{pending.length}</b> neue Vertrag-Entwürfe aus PDF erkannt. Jetzt bestätigen.</div>
+          <div style={{display:'flex', gap:8}}>
+            <Button variant="outline" onClick={confirmAllDrafts}><CheckCircle2 size={16}/> Alle übernehmen</Button>
+          </div>
+        </div>
+      )}
+
       <header style={{display:'flex', gap:12, alignItems:'flex-end', justifyContent:'space-between', marginBottom:12}}>
         <div>
           <h1 style={{fontSize:24, fontWeight:700}}>Miet-Checker PRO (PWA + KI)</h1>
-          <p className="muted">Installierbar · Offline · KI-Vertragsimport (PDF/Scan)</p>
+          <p className="muted">Installierbar · Offline · KI-Vertragsimport (PDF/Scan) · Auto-Posteingang</p>
         </div>
         <div style={{display:'flex', gap:8, alignItems:'center'}}>
           <div style={{display:'flex', gap:6, alignItems:'center'}}>
@@ -290,8 +439,9 @@ export default function MietCheckerApp(){
         </div>
       </header>
 
-      <Tabs defaultValue="kiimport">
+      <Tabs defaultValue="eingang">
         <TabsList>
+          <TabsTrigger value="eingang"><Inbox size={16}/> Posteingang</TabsTrigger>
           <TabsTrigger value="objekte">Objekte & Zimmer</TabsTrigger>
           <TabsTrigger value="vertraege">Verträge</TabsTrigger>
           <TabsTrigger value="bank">Bankdaten</TabsTrigger>
@@ -300,14 +450,72 @@ export default function MietCheckerApp(){
           <TabsTrigger value="einstellungen"><Settings2 size={16}/>Einstellungen</TabsTrigger>
         </TabsList>
 
+        <TabsContent value="eingang"><InboxSection pending={pending} confirmDraft={confirmDraft} rejectDraft={rejectDraft} /></TabsContent>
         <TabsContent value="objekte"><ObjectsUnitsSection properties={properties} setProperties={setProperties} units={units} setUnits={setUnits} /></TabsContent>
         <TabsContent value="vertraege"><ContractsSection units={units} properties={properties} contracts={contracts} setContracts={setContracts} rentLabel={rentLabel} /></TabsContent>
         <TabsContent value="bank"><BankSection txHeaders={txHeaders} txMap={txMap} setTxMap={setTxMap} onUploadTxs={onUploadTxs} /></TabsContent>
         <TabsContent value="uebersicht"><OverviewSection matches={matches} missing={missing} partial={partial} overpaid={overpaid} selectedMonth={selectedMonth} /></TabsContent>
-        <TabsContent value="kiimport"><KiImportSection units={units} properties={properties} setContracts={setContracts} /></TabsContent>
-        <TabsContent value="einstellungen"><SettingsSection graceDays={graceDays} amountTolerance={amountTolerance} setGraceDays={setGraceDays} setAmountTolerance={setAmountTolerance} settings={settings} setSettings={setSettings} /></TabsContent>
+        <TabsContent value="kiimport"><KiImportSection
+          units={units}
+          properties={properties}
+          onAutoDraft={createDraftsFromExtraction}
+          settings={settings}
+        /></TabsContent>
+        <TabsContent value="einstellungen"><SettingsSection
+          graceDays={graceDays} amountTolerance={amountTolerance}
+          setGraceDays={setGraceDays} setAmountTolerance={setAmountTolerance}
+          settings={settings} setSettings={setSettings}
+        /></TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+// ------------------ Sections ------------------
+function InboxSection({ pending, confirmDraft, rejectDraft }:{pending:any[]; confirmDraft:(i:number)=>void; rejectDraft:(i:number)=>void;}){
+  return (
+    <Card>
+      <CardHeader><CardTitle>Posteingang</CardTitle><CardDescription>Automatisch erkannte Verträge (prüfen & bestätigen)</CardDescription></CardHeader>
+      <CardContent>
+        {pending.length===0 ? <p className="muted">Keine Entwürfe vorhanden.</p> : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Datei</TableHead>
+                <TableHead>Mieter</TableHead>
+                <TableHead>Miete (€)</TableHead>
+                <TableHead>Kaution (€)</TableHead>
+                <TableHead>Start</TableHead>
+                <TableHead>Adresse</TableHead>
+                <TableHead>Einheit</TableHead>
+                <TableHead>Zimmer</TableHead>
+                <TableHead>Aktion</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {pending.map((r:any,i:number)=>(
+                <TableRow key={i}>
+                  <TableCell className="text-sm">{r.fileName}</TableCell>
+                  <TableCell>{r.extracted.tenantName||'–'}</TableCell>
+                  <TableCell>{Number(r.extracted.expected||0).toFixed(2)}</TableCell>
+                  <TableCell>{Number(r.extracted.deposit||0).toFixed(2)}</TableCell>
+                  <TableCell>{r.extracted.startDate||'–'}</TableCell>
+                  <TableCell>{r.extracted.address||'–'}</TableCell>
+                  <TableCell>{r.matchedUnit? r.matchedUnit.label: (r.extracted.unitLabel||'–')}</TableCell>
+                  <TableCell>{r.extracted.roomNumber||'–'}</TableCell>
+                  <TableCell>
+                    <div style={{display:'flex', gap:8}}>
+                      <Button onClick={()=>confirmDraft(i)}><CheckCircle2 size={16}/>Übernehmen</Button>
+                      <Button variant="outline" onClick={()=>rejectDraft(i)}><XCircle size={16}/>Verwerfen</Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -457,15 +665,29 @@ function OverviewSection({ matches, missing, partial, overpaid, selectedMonth }:
   );
 }
 
-function SettingsSection({ graceDays, amountTolerance, setGraceDays, setAmountTolerance, settings, setSettings }:{graceDays:number;amountTolerance:number;setGraceDays:any;setAmountTolerance:any;settings:any;setSettings:any;}){
+function SettingsSection({
+  graceDays, amountTolerance, setGraceDays, setAmountTolerance, settings, setSettings
+}:{graceDays:number;amountTolerance:number;setGraceDays:any;setAmountTolerance:any;settings:any;setSettings:any;}){
   return (
     <Card>
-      <CardHeader><CardTitle>Einstellungen</CardTitle><CardDescription>Fälligkeit, Toleranzen & Anzeigenamen</CardDescription></CardHeader>
+      <CardHeader><CardTitle>Einstellungen</CardTitle><CardDescription>Fälligkeit, Toleranzen & Automatik</CardDescription></CardHeader>
       <CardContent className="space-y-4">
         <div style={{display:'grid', gap:12, gridTemplateColumns:'1fr 1fr 1fr'}}>
           <div><Label>Nachfrist (Tage)</Label><Input type="number" min={0} max={10} value={graceDays} onChange={(e)=> setGraceDays(Number((e.target as HTMLInputElement).value)||0)}/></div>
           <div><Label>Betrags-Toleranz (€)</Label><Input type="number" min={0} step="0.5" value={amountTolerance} onChange={(e)=> setAmountTolerance(Number((e.target as HTMLInputElement).value)||0)}/></div>
           <div><Label>Anzeigename für Miete</Label><Input value={settings?.rentLabel||"Miete"} onChange={(e)=> setSettings({...settings, rentLabel: (e.target as HTMLInputElement).value})} /></div>
+        </div>
+        <div style={{display:'grid', gap:12, gridTemplateColumns:'1fr 1fr'}}>
+          <label style={{display:'flex', gap:8, alignItems:'center'}}>
+            <input type="checkbox" checked={!!settings?.autoDraftOnUpload}
+                   onChange={(e)=> setSettings({...settings, autoDraftOnUpload: e.currentTarget.checked})}/>
+            <span>PDF-Upload erzeugt automatisch Entwürfe (Posteingang)</span>
+          </label>
+          <label style={{display:'flex', gap:8, alignItems:'center'}}>
+            <input type="checkbox" checked={!!settings?.autoCreatePropertyUnit}
+                   onChange={(e)=> setSettings({...settings, autoCreatePropertyUnit: e.currentTarget.checked})}/>
+            <span>Objekt/Einheit automatisch anlegen (aus Adresse/Zimmer)</span>
+          </label>
         </div>
       </CardContent>
     </Card>
@@ -473,7 +695,9 @@ function SettingsSection({ graceDays, amountTolerance, setGraceDays, setAmountTo
 }
 
 // ------------------ KI Import (PDF/Scan) ------------------
-function KiImportSection({ units, properties, setContracts }:{units:any[];properties:any[];setContracts:any;}){
+function KiImportSection({
+  units, properties, onAutoDraft, settings
+}:{units:any[];properties:any[];onAutoDraft:(previews:any[])=>void;settings:any;}){
   const [mappingText, setMappingText] = useState(JSON.stringify(DEFAULT_MAPPING, null, 2));
   const [results, setResults] = useState<any[]>([]);
   const [busy, setBusy] = useState(false);
@@ -507,7 +731,7 @@ function KiImportSection({ units, properties, setContracts }:{units:any[];proper
   const onFiles = async (files: File[]) => {
     setBusy(true);
     try{
-      const map = JSON.parse(mappingText);
+      JSON.parse(mappingText); // (aktuell ungenutzt, aber validiert)
       const previews: any[] = [];
       for (const file of files){
         let text = '';
@@ -519,10 +743,10 @@ function KiImportSection({ units, properties, setContracts }:{units:any[];proper
         } else if (file.type.startsWith('text/')){
           text = await file.text();
         }
-        const extracted = extractWithMapping(text, map);
-        // best-effort unit match: prefer exact label, fallback contains
+        const extracted = extractWithMapping(text, DEFAULT_MAPPING);
+        // Besterhende Unit heuristisch finden (ohne Auto-Anlage hier – das macht App beim Draften)
         const label = extracted.unitLabel?.trim();
-        let unit: any = null;
+        let unit = null;
         if (label){
           unit = units.find((u:any)=> u.label.toLowerCase() === label.toLowerCase())
               || units.find((u:any)=> label.toLowerCase().includes(u.label.toLowerCase()))
@@ -531,80 +755,45 @@ function KiImportSection({ units, properties, setContracts }:{units:any[];proper
         previews.push({ fileName: (file as any).name, textLength: text.length, extracted, matchedUnit: unit });
       }
       setResults(previews);
+
+      // *** AUTO-DRAFT ***: direkt in den Posteingang der App legen
+      if (settings?.autoDraftOnUpload) onAutoDraft(previews);
+
     }catch(e:any){
       alert('Mapping ist kein gültiges JSON: '+ e.message);
     } finally { setBusy(false); }
   };
 
-  const commitAll = () => {
-    const ok = results.filter((r:any)=> r.matchedUnit && r.extracted.tenantName && r.extracted.expected);
-    if (ok.length === 0){ alert('Keine verwertbaren Einträge gefunden.'); return; }
-    setContracts((cs:any[])=> [
-      ...cs,
-      ...ok.map(({ matchedUnit, extracted }:any) => ({
-        id: uid(),
-        unitId: matchedUnit.id,
-        tenantName: extracted.tenantName,
-        tenantIban: extracted.iban||'',
-        expected: Number(extracted.expected)||0,
-        dueDay: 3,
-        // include address + room number in reference for visibility & matching
-        reference:
-          extracted.unitLabel
-            ? `Miete ${extracted.unitLabel}${extracted.roomNumber ? ' (Zi ' + extracted.roomNumber + ')' : ''} — ${extracted.address || 'Objekt'}`
-            : `Miete${extracted.roomNumber ? ' (Zi ' + extracted.roomNumber + ')' : ''} — ${extracted.address || 'Objekt'}`,
-        startDate: extracted.startDate||'',
-        endDate: '',
-        deposit: Number(extracted.deposit)||0,
-        roomNumber: extracted.roomNumber || ''
-      }))
-    ]);
-    alert(`${ok.length} Vertrag/Verträge angelegt.`);
-  };
-
   return (
-    <div style={{display:'grid', gap:16}}>
-      <Card>
-        <CardHeader><CardTitle>Mapping</CardTitle><CardDescription>Definiere, wo die KI die Werte findet</CardDescription></CardHeader>
-        <CardContent className="space-y-3">
-          <Textarea rows={16} value={mappingText} onChange={(e)=> setMappingText((e.target as HTMLTextAreaElement).value)} />
-          <p className="muted" style={{fontSize:14}}>Felder: tenantName, rent→expected, deposit, startDate, roomLabel→roomNumber/unitLabel, address.</p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader><CardTitle>PDF/Scan hochladen</CardTitle><CardDescription>Mehrere Dateien möglich (einheitliche Verträge)</CardDescription></CardHeader>
-        <CardContent className="space-y-3">
-          <Input type="file" accept="application/pdf,text/plain" multiple onChange={(e)=> e.target.files && onFiles([...(e.target.files as any)])} />
-          <Button disabled={busy} variant="outline" onClick={()=> (document.querySelector('input[type=file]') as HTMLInputElement)?.click()}><Upload size={16}/>Dateien wählen</Button>
-          {busy && <p>Analysiere …</p>}
-          {results.length>0 && (
-            <>
-              <Table className="mt-3">
-                <TableHeader><TableRow><TableHead>Datei</TableHead><TableHead>Mieter</TableHead><TableHead>{"Miete (EUR)"}</TableHead><TableHead>Kaution</TableHead><TableHead>Start</TableHead><TableHead>Einheit</TableHead><TableHead>Zimmer</TableHead><TableHead>Adresse</TableHead><TableHead>Status</TableHead></TableRow></TableHeader>
-                <TableBody>
-                  {results.map((r:any,i:number)=> (
-                    <TableRow key={i}>
-                      <TableCell className="text-sm">{r.fileName}</TableCell>
-                      <TableCell>{r.extracted.tenantName||'–'}</TableCell>
-                      <TableCell>{Number(r.extracted.expected||0).toFixed(2)}</TableCell>
-                      <TableCell>{Number(r.extracted.deposit||0).toFixed(2)}</TableCell>
-                      <TableCell>{r.extracted.startDate||'–'}</TableCell>
-                      <TableCell>{r.matchedUnit? r.matchedUnit.label: (r.extracted.unitLabel||'–')}</TableCell>
-                      <TableCell>{r.extracted.roomNumber||'–'}</TableCell>
-                      <TableCell>{r.extracted.address||'–'}</TableCell>
-                      <TableCell>{r.matchedUnit? 'zugeordnet' : 'Einheit nicht gefunden'}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-              <div style={{paddingTop:12}}>
-                <Button onClick={commitAll}><FileSignature size={16}/>Alle übernehmen</Button>
-              </div>
-            </>
-          )}
-        </CardContent>
-      </Card>
-    </div>
+    <Card>
+      <CardHeader><CardTitle>Verträge importieren (KI)</CardTitle><CardDescription>PDF/Scan hochladen → Entwürfe im Posteingang bestätigen</CardDescription></CardHeader>
+      <CardContent className="space-y-3">
+        <Input type="file" accept="application/pdf,text/plain" multiple onChange={(e)=> e.target.files && onFiles([...(e.target.files as any)])} />
+        <Button disabled={busy} variant="outline" onClick={()=> (document.querySelector('input[type=file]') as HTMLInputElement)?.click()}><Upload size={16}/>Dateien wählen</Button>
+        {busy && <p>Analysiere …</p>}
+        {(!settings?.autoDraftOnUpload && results.length>0) && (
+          <>
+            <p className="muted" style={{marginTop:8}}>Auto-Posteingang ist deaktiviert. Vorschau unten, Übernahme manuell.</p>
+            <Table className="mt-3">
+              <TableHeader><TableRow><TableHead>Datei</TableHead><TableHead>Mieter</TableHead><TableHead>{"Miete (EUR)"}</TableHead><TableHead>Kaution</TableHead><TableHead>Start</TableHead><TableHead>Einheit</TableHead><TableHead>Zimmer</TableHead><TableHead>Adresse</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {results.map((r:any,i:number)=> (
+                  <TableRow key={i}>
+                    <TableCell className="text-sm">{r.fileName}</TableCell>
+                    <TableCell>{r.extracted.tenantName||'–'}</TableCell>
+                    <TableCell>{Number(r.extracted.expected||0).toFixed(2)}</TableCell>
+                    <TableCell>{Number(r.extracted.deposit||0).toFixed(2)}</TableCell>
+                    <TableCell>{r.extracted.startDate||'–'}</TableCell>
+                    <TableCell>{r.matchedUnit? r.matchedUnit.label: (r.extracted.unitLabel||'–')}</TableCell>
+                    <TableCell>{r.extracted.roomNumber||'–'}</TableCell>
+                    <TableCell>{r.extracted.address||'–'}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
